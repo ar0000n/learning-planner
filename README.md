@@ -11,12 +11,16 @@ Two AI agents collaborate on every plan:
 
 The final output shown to you (and saved, if requested) is always the refined plan.
 
+A **memory layer** persists across sessions in a local `memory.json` file. After each plan, the topic, familiarity level, date, and the critic's flagged weaknesses are saved. On the next run, both agents are given a summary of what you've already studied and where you struggled — so if your next topic builds on a previous one, the plan picks up from where you left off rather than starting from scratch.
+
 ## Features
 
 - Two-agent pipeline: Generator → Critic → refined plan
+- Memory layer — agents are aware of your prior topics and weak areas
 - Familiarity selector (Novice / A little familiar / Quite familiar) that adjusts pacing and depth
 - Gradual difficulty progression — Day 1 is conceptual, Day 5 is production-ready
 - `--verbose` mode to see the original draft and the critic's feedback alongside the final plan
+- `--history` to view all topics studied and weaknesses flagged
 - Optional save to a dated Markdown file
 
 ## Requirements
@@ -68,6 +72,28 @@ Verbose mode shows three sections in sequence:
 3. **Critic Agent — refined plan** — the final improved plan
 
 Without `--verbose`, only the refined plan is shown.
+
+### View your learning history
+
+```bash
+python planner.py --history
+```
+
+Shows every topic studied, the familiarity level, the date, and the weak areas the Critic Agent flagged:
+
+```
+Learning History — 3 sessions
+
+  1. Apache Kafka  (Novice · 2026-02-20)
+       • Day 3 jumped too quickly into partition management
+       • Resource on Day 2 was a generic blog post, not an official source
+
+  2. Docker  (A little familiar · 2026-02-21)
+       • Exercise on Day 4 was not completable in 60 minutes
+
+  3. Kubernetes  (Novice · 2026-02-22)
+       • Difficulty spiked on Day 2 with no scaffolding for kubectl syntax
+```
 
 ### Save to a Markdown file
 
@@ -172,6 +198,12 @@ The file includes a title, generation date, familiarity level, and the full plan
 | **A little familiar** | Done a tutorial or read an overview | Sharpen mental models | Confident enough to own a feature |
 | **Quite familiar** | Built small projects with the topic | Challenge existing knowledge | Ready to architect and lead |
 
+## Known Limitations
+
+**Memory uses simple string matching, not semantic understanding.** Topics are stored and compared as plain strings, so the tool has no way to detect that "Apache Kafka" and "event streaming" are related, or that "Kubernetes" builds on "Docker". Both agents are given the full list of prior topics and asked to reason about relevance themselves, but this relies on the model making the connection rather than any structured relationship detection.
+
+A natural upgrade path is to replace the JSON memory file with a vector database. Each topic would be converted to an embedding on save, and at the start of a new session the current topic would be embedded and compared against stored embeddings using cosine similarity. This would surface semantically related prior topics reliably — for example, recognising that a session on "distributed systems" is highly relevant when studying "Apache Kafka" — without depending on exact string matches or model inference.
+
 ## Project structure
 
 ```
@@ -180,6 +212,7 @@ learning-planner/
 ├── requirements.txt  # dependencies
 ├── .env.example      # API key template (copy to .env and fill in)
 ├── .env              # your API key — never committed
+├── memory.json       # learning history — created automatically, never committed
 ├── .gitignore
 └── README.md
 ```

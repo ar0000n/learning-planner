@@ -6,17 +6,20 @@ Two AI agents collaborate on every plan:
   - Generator Agent  creates the initial plan
   - Critic Agent     evaluates and produces a refined version
 
-The final output is always the refined plan.
+A memory layer (memory.json) persists prior topics and weak areas across sessions
+so both agents can build on what the user has already studied.
 
 Usage:
     python planner.py "Python programming"
     python planner.py "Docker" --verbose   # also shows original + critique
     python planner.py --save "Kubernetes"  # saves refined plan to markdown
+    python planner.py --history            # show all studied topics
     python planner.py                      # prompts interactively
 """
 
 import sys
 import re
+import json
 import argparse
 from datetime import date
 from pathlib import Path
@@ -24,6 +27,8 @@ import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+MEMORY_FILE = Path(__file__).parent / "memory.json"
 
 # ── Generator Agent prompt ────────────────────────────────────────────────────
 
@@ -90,8 +95,12 @@ Evaluate it, then produce an improved version. Your response must use this exact
 with no text outside it:
 
 ## Assessment
-<Your critique covering difficulty progression, resource credibility, exercise practicality, \
-and confidence outcome. Be specific about what is weak and why.>
+<Your detailed critique covering difficulty progression, resource credibility, \
+exercise practicality, and confidence outcome. Be specific about what is weak and why.>
+
+## Key Weaknesses
+<A bullet list of 2–5 specific weaknesses, each in one concise sentence. \
+These will be saved to personalise future plans.>
 
 ## Refined Plan
 <The improved Monday–Friday plan using the same format as the original. \
@@ -140,6 +149,70 @@ FAMILIARITY_LEVELS = [
     },
 ]
 
+# ── Memory ────────────────────────────────────────────────────────────────────
+
+def load_memory() -> list[dict]:
+    """Load all prior sessions from memory.json. Returns [] if the file is absent or corrupt."""
+    if not MEMORY_FILE.exists():
+        return []
+    try:
+        data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        return data.get("sessions", [])
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+def save_to_memory(topic: str, familiarity: dict, date_str: str) -> None:
+    """Append a completed session to memory.json."""
+    sessions = load_memory()
+    sessions.append({
+        "topic": topic,
+        "familiarity_label": familiarity["label"],
+        "date": date_str,
+    })
+    MEMORY_FILE.write_text(
+        json.dumps({"sessions": sessions}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def build_memory_context(sessions: list[dict], current_topic: str) -> str:
+    """
+    Build a memory context string to inject into agent system prompts.
+    Returns an empty string if there are no prior sessions.
+    """
+    if not sessions:
+        return ""
+
+    lines = [
+        "## Prior Learning History",
+        "This user has previously studied the following topics:",
+    ]
+    for s in sessions:
+        lines.append(f"- {s['topic']} ({s['familiarity_label']}, {s['date']})")
+
+    lines += [
+        "",
+        f"Current topic: {current_topic}",
+        "If the current topic is related to any previously studied topic, explicitly build on "
+        "that prior knowledge rather than starting from scratch. "
+        "Do not re-explain concepts the user has already covered.",
+    ]
+
+    return "\n".join(lines)
+
+
+def show_history(sessions: list[dict]) -> None:
+    """Print all prior sessions to stdout."""
+    if not sessions:
+        print("\nNo learning history yet. Generate your first plan to get started.")
+        return
+
+    count = len(sessions)
+    print(f"\nLearning History — {count} session{'s' if count != 1 else ''}\n")
+    for i, s in enumerate(sessions, 1):
+        print(f"  {i}. {s['topic']}  ({s['familiarity_label']} · {s['date']})")
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def prompt_familiarity(topic: str) -> dict:
@@ -180,9 +253,43 @@ def section(title: str) -> None:
     print(f" {title}")
     print("─" * 60 + "\n")
 
+
+def parse_critic_response(text: str) -> tuple[str, list[str], str]:
+    """
+    Split the critic's response into (assessment, weaknesses, refined_plan).
+    Handles missing sections gracefully.
+    """
+    assessment, weaknesses, refined = "", [], text.strip()
+
+    if "## Key Weaknesses" in text and "## Refined Plan" in text:
+        a_part, rest = text.split("## Key Weaknesses", 1)
+        assessment = a_part.replace("## Assessment", "").strip()
+
+        w_part, r_part = rest.split("## Refined Plan", 1)
+        weaknesses = [
+            line.lstrip("-•* ").strip()
+            for line in w_part.splitlines()
+            if line.strip() and line.strip()[0] in "-•*"
+        ]
+        refined = r_part.strip()
+
+    elif "## Refined Plan" in text:
+        # Critic produced assessment + refined plan but skipped the weaknesses section
+        a_part, r_part = text.split("## Refined Plan", 1)
+        assessment = a_part.replace("## Assessment", "").strip()
+        refined = r_part.strip()
+
+    return assessment, weaknesses, refined
+
 # ── Agents ────────────────────────────────────────────────────────────────────
 
-def run_generator(client: anthropic.Anthropic, topic: str, familiarity: dict, verbose: bool) -> str:
+def run_generator(
+    client: anthropic.Anthropic,
+    topic: str,
+    familiarity: dict,
+    memory_context: str,
+    verbose: bool,
+) -> str:
     """
     Generator Agent — drafts the initial learning plan.
     Streams to stdout when verbose; always returns the full plan text.
@@ -194,11 +301,15 @@ def run_generator(client: anthropic.Anthropic, topic: str, familiarity: dict, ve
         familiarity_context=familiarity["context"],
     )
 
+    system = GENERATOR_SYSTEM_PROMPT
+    if memory_context:
+        system += "\n\n" + memory_context
+
     chunks: list[str] = []
     with client.messages.stream(
         model="claude-haiku-4-5-20251001",
         max_tokens=4096,
-        system=GENERATOR_SYSTEM_PROMPT,
+        system=system,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
         for text in stream.text_stream:
@@ -210,11 +321,15 @@ def run_generator(client: anthropic.Anthropic, topic: str, familiarity: dict, ve
 
 
 def run_critic(
-    client: anthropic.Anthropic, topic: str, familiarity: dict, original_plan: str
-) -> tuple[str, str]:
+    client: anthropic.Anthropic,
+    topic: str,
+    familiarity: dict,
+    original_plan: str,
+    memory_context: str,
+) -> tuple[str, list[str], str]:
     """
     Critic Agent — evaluates the draft plan and returns an improved version.
-    Returns (assessment, refined_plan).
+    Returns (assessment, weaknesses, refined_plan).
     """
     prompt = CRITIC_PROMPT_TEMPLATE.format(
         topic=topic,
@@ -222,26 +337,18 @@ def run_critic(
         original_plan=original_plan,
     )
 
+    system = CRITIC_SYSTEM_PROMPT
+    if memory_context:
+        system += "\n\n" + memory_context
+
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=8192,
-        system=CRITIC_SYSTEM_PROMPT,
+        system=system,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    full_text = response.content[0].text
-    marker = "## Refined Plan"
-
-    if marker in full_text:
-        before, after = full_text.split(marker, 1)
-        assessment = before.replace("## Assessment", "").strip()
-        refined = after.strip()
-    else:
-        # Fallback: the critic didn't follow the format; treat everything as refined
-        assessment = ""
-        refined = full_text.strip()
-
-    return assessment, refined
+    return parse_critic_response(response.content[0].text)
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
@@ -250,31 +357,44 @@ def generate_learning_plan(
 ) -> None:
     client = anthropic.Anthropic()
 
-    # ── Step 1: Generator Agent ───────────────────────────────
+    # ── Step 1: Load memory and build context ─────────────────
+    sessions = load_memory()
+    if sessions:
+        count = len(sessions)
+        print(f"\nLoaded {count} prior session{'s' if count != 1 else ''} from memory.")
+    memory_context = build_memory_context(sessions, topic)
+
+    # ── Step 2: Generator Agent ───────────────────────────────
     if verbose:
         section("Generator Agent")
     else:
         print("\nGenerating plan...", end="", flush=True)
 
-    original_plan = run_generator(client, topic, familiarity, verbose)
+    original_plan = run_generator(client, topic, familiarity, memory_context, verbose)
 
     if not verbose:
         print(" done.")
 
-    # ── Step 2: Critic Agent ──────────────────────────────────
+    # ── Step 3: Critic Agent ──────────────────────────────────
     if verbose:
         section("Critic Agent — evaluating...")
     else:
         print("Refining with Critic Agent...", end="", flush=True)
 
-    assessment, refined_plan = run_critic(client, topic, familiarity, original_plan)
+    assessment, weaknesses, refined_plan = run_critic(
+        client, topic, familiarity, original_plan, memory_context
+    )
 
     if not verbose:
         print(" done.\n")
 
-    # ── Step 3: Display results ───────────────────────────────
+    # ── Step 4: Display results ───────────────────────────────
     if verbose and assessment:
         print(assessment)
+        if weaknesses:
+            print("\nKey weaknesses identified:")
+            for w in weaknesses:
+                print(f"  • {w}")
         section("Critic Agent — refined plan")
 
     print(f"1-Week Learning Plan: {topic}")
@@ -283,9 +403,13 @@ def generate_learning_plan(
     print("\n" + "=" * 60)
     print("Plan complete. Good luck with your studies!")
 
-    # ── Step 4: Save to markdown ──────────────────────────────
+    # ── Step 5: Save to memory ────────────────────────────────
+    today = date.today().strftime("%Y-%m-%d")
+    save_to_memory(topic, familiarity, today)
+    print("Session saved to memory.")
+
+    # ── Step 6: Save to markdown ──────────────────────────────
     if save:
-        today = date.today().strftime("%Y-%m-%d")
         slug = slugify(topic)
         filename = f"learning-plan-{slug}-{today}.md"
         output_path = Path(filename)
@@ -307,9 +431,9 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             '  python planner.py "Python programming"\n'
-            '  python planner.py "machine learning"\n'
             '  python planner.py "Docker" --verbose\n'
             '  python planner.py "Redis" --save\n'
+            "  python planner.py --history\n"
             "  python planner.py          # interactive prompt"
         ),
     )
@@ -331,8 +455,17 @@ def main() -> None:
             "before the final refined plan."
         ),
     )
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="Show all topics studied so far and their flagged weak areas.",
+    )
 
     args = parser.parse_args()
+
+    if args.history:
+        show_history(load_memory())
+        return
 
     topic = args.topic
     if not topic:

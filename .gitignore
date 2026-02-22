@@ -9,6 +9,9 @@
 # Generated learning plans
 learning-plan-*.md
 
+# Learning history (personal data, stays local)
+memory.json
+
 # Python cache
 __pycache__/
 *.pyc
