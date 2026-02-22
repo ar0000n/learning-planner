@@ -17,15 +17,19 @@ A CLI tool that generates a structured 1-week learning plan for any topic using 
 ## Installation
 
 ```bash
-# 1. Clone or download the project
+# 1. Clone the repo
+git clone https://github.com/ar0000n/learning-planner.git
 cd learning-planner
 
-# 2. Install the dependency
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Set your API key
-export ANTHROPIC_API_KEY=your-key-here
+# 3. Add your API key
+cp .env.example .env
+# Open .env and replace your-api-key-here with your actual key
 ```
+
+Get your API key from [console.anthropic.com](https://console.anthropic.com/).
 
 ## Usage
 
@@ -112,6 +116,9 @@ The file includes a title, generation date, familiarity level, and the full plan
 ```
 learning-planner/
 ├── planner.py        # CLI tool
-├── requirements.txt  # anthropic SDK dependency
+├── requirements.txt  # dependencies
+├── .env.example      # API key template (copy to .env and fill in)
+├── .env              # your API key — never committed
+├── .gitignore
 └── README.md
 ```

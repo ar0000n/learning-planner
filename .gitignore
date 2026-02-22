@@ -1,6 +1,10 @@
-# Environment
+# Environment — keep .env.example, ignore everything else
 .env
-.env.*
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
 
 # Generated learning plans
 learning-plan-*.md
